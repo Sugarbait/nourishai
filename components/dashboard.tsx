@@ -1384,7 +1384,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
     try {
       const result = await getFoodRecognition({ photoDataUri: dataUri });
       if (result.foodItems.length === 0) {
-        toast({ title: 'No food detected', description: 'We couldn\'t identify any food items in the image. Try a clearer picture or add it manually.' });
+        toast({ title: 'No food detected', description: 'We couldn\'t identify any food items in the image. No credit was charged — try a clearer picture or add it manually.' });
       } else {
         // Deduct credit on successful recognition
         const updatedCredits = consumeMealCredit(credits);
