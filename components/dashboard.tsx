@@ -406,10 +406,10 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
       .filter(d => !isNaN(d.getTime()));
   }, [trackedDates]);
 
-  // Read user display info from localStorage
-  const userName = typeof window !== 'undefined' ? localStorage.getItem('nourish_user_name') : null;
-  const userAvatar = typeof window !== 'undefined' ? localStorage.getItem('nourish_user_avatar') : null;
-  const userEmail = typeof window !== 'undefined' ? localStorage.getItem('nourish_user_email') : null;
+  // Prefer server values (consistent across browsers); fall back to localStorage while Convex loads
+  const userName = convexProfile?.name || (typeof window !== 'undefined' ? localStorage.getItem('nourish_user_name') : null);
+  const userAvatar = convexProfile?.avatar || (typeof window !== 'undefined' ? localStorage.getItem('nourish_user_avatar') : null);
+  const userEmail = convexProfile?.email || (typeof window !== 'undefined' ? localStorage.getItem('nourish_user_email') : null);
 
   // Microsoft OAuth now uses PKCE auth code flow — redirect lands on '/' which handles
   // the token exchange and then redirects here. No hash token handling needed.
