@@ -836,8 +836,14 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
 
   // Sync credits from Convex — authoritative source of truth.
   // Runs whenever convexCredits changes (e.g. after a purchase webhook fires).
+  // Syncs all server state — credits, daily flags, AND subscription — into
+  // localStorage so both Stripe and Google Play subscriptions are reflected.
   useEffect(() => {
     if (!convexCredits) return;
+    const serverSub = (convexCredits as any).subscription as
+      | { active: boolean; plan: 'monthly' | 'yearly' | null; expiresAt: number | null }
+      | null
+      | undefined;
     setCredits(prev => {
       const merged = {
         ...prev,
@@ -845,6 +851,13 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
         lastFreeDate: convexCredits.lastFreeDate ?? prev.lastFreeDate,
         dailyFreeMealUsed: convexCredits.dailyFreeMealUsed ?? prev.dailyFreeMealUsed,
         dailyFreeAIUsed: convexCredits.dailyFreeAIUsed ?? prev.dailyFreeAIUsed,
+        subscription: serverSub
+          ? {
+              active: serverSub.active,
+              plan: serverSub.plan ?? 'monthly',
+              expiresAt: serverSub.expiresAt ? new Date(serverSub.expiresAt).toISOString() : null,
+            }
+          : prev.subscription,
       };
       saveCredits(merged);
       return merged;
