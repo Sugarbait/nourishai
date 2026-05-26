@@ -4,7 +4,7 @@ import { action } from "./_generated/server";
 import { v } from "convex/values";
 import { UserRefreshClient } from "google-auth-library";
 
-const MODEL = "gemini-3.1-flash-lite";
+const MODEL = "gemini-3.1-flash-lite-preview";
 
 function getMostFrequentMealTypes(meals: any[]): string {
   const mealTypeCounts: Record<string, number> = {};
@@ -45,6 +45,37 @@ function buildHistoricalContext(historicalMeals: any[]): string {
   const macroSplit = calculateHistoricalMacros(historicalMeals);
 
   return `\nHISTORICAL PATTERNS (Past Year):\nTotal meals logged: ${totalMeals}\nAverage daily intake: ${avgDailyIntake} kcal\nFavorite meal types: ${favoriteTypes}\nAverage macro split: ${macroSplit}`;
+}
+
+/**
+ * Strip common markdown syntax from a plain-prose response. Safety net for the
+ * AI coach: the system instruction tells the model not to use markdown, but a
+ * minority of replies still slip through with **bold** or "- bullets". We
+ * clean them here so the UI never has to render markdown.
+ */
+function stripMarkdown(input: string): string {
+  let s = input;
+  // Fenced code blocks: keep the inner text, drop the fences
+  s = s.replace(/```[\w-]*\n?([\s\S]*?)```/g, "$1");
+  // Inline code: drop the backticks
+  s = s.replace(/`+([^`]+)`+/g, "$1");
+  // Bold / italic markers
+  s = s.replace(/\*\*(.+?)\*\*/g, "$1");
+  s = s.replace(/__(.+?)__/g, "$1");
+  s = s.replace(/(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)/g, "$1");
+  s = s.replace(/(?<!_)_(?!_)([^_\n]+?)(?<!_)_(?!_)/g, "$1");
+  // Markdown links [text](url) -> text
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
+  // Line-leading markers: heading hashes, bullets, numbered lists, blockquotes
+  s = s.replace(/^[ \t]*#{1,6}[ \t]+/gm, "");
+  s = s.replace(/^[ \t]*[-*+][ \t]+/gm, "");
+  s = s.replace(/^[ \t]*\d+\.[ \t]+/gm, "");
+  s = s.replace(/^[ \t]*>[ \t]?/gm, "");
+  // Horizontal rules
+  s = s.replace(/^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$/gm, "");
+  // Collapse 3+ blank lines into 2
+  s = s.replace(/\n{3,}/g, "\n\n");
+  return s.trim();
 }
 
 async function getAccessToken(): Promise<string> {
@@ -129,7 +160,7 @@ export const recognizeFoodFromImage = action({
         role: "user",
         parts: [
           {
-            text: 'Analyze this food image. Identify all food items and estimate calories. Provide a health score 1-100 and brief analysis. Respond with valid JSON only, no markdown: {"isFood": boolean, "foodItems": [{"name": string, "calories": number}], "healthiness": {"score": number, "analysis": string}}',
+            text: 'Analyze this food image. Carefully estimate the PORTION SIZE of each item based on visual cues (plate size, utensils, packaging, how full the container is). Scale the calories AND macronutrients to match the actual amount of food visible — a large serving must report proportionally higher numbers than a small one. For each item provide: name, estimated portion (e.g. "1 cup", "approx 150g", "1 medium apple"), calories, and grams of protein, carbs, and fat for that specific portion. Also provide a health score 1-100 and a brief analysis. Respond with valid JSON only, no markdown: {"isFood": boolean, "foodItems": [{"name": string, "portion": string, "calories": number, "protein": number, "carbs": number, "fat": number}], "healthiness": {"score": number, "analysis": string}}',
           },
           { inlineData: { mimeType, data: base64Data } },
         ],
@@ -137,7 +168,7 @@ export const recognizeFoodFromImage = action({
     ];
 
     const systemInstruction =
-      "You are an expert at identifying food in images and analyzing nutritional value. Always respond with valid JSON only, no markdown code blocks.";
+      "You are an expert nutritionist who specializes in estimating food portion sizes from images and calculating accurate per-portion nutrition. Pay close attention to how much food is actually shown and scale all numbers (calories, protein, carbs, fat) to the visible portion. Always respond with valid JSON only, no markdown code blocks.";
 
     try {
       const response = await callVertexGemini(contents, systemInstruction);
@@ -149,13 +180,19 @@ export const recognizeFoodFromImage = action({
       }
 
       return {
-        foodItems: parsed.foodItems.map((food: any) => ({
-          ...food,
-          confidence: 0.9,
-          protein: Math.round((food.calories * 0.25) / 4),
-          carbs:   Math.round((food.calories * 0.45) / 4),
-          fat:     Math.round((food.calories * 0.30) / 9),
-        })),
+        foodItems: parsed.foodItems.map((food: any) => {
+          const cals = Number(food.calories) || 0;
+          const hasNum = (v: any) => typeof v === "number" && !Number.isNaN(v);
+          return {
+            name: food.name,
+            calories: cals,
+            portion: typeof food.portion === "string" ? food.portion : undefined,
+            confidence: 0.9,
+            protein: hasNum(food.protein) ? Math.round(food.protein) : Math.round((cals * 0.25) / 4),
+            carbs:   hasNum(food.carbs)   ? Math.round(food.carbs)   : Math.round((cals * 0.45) / 4),
+            fat:     hasNum(food.fat)     ? Math.round(food.fat)     : Math.round((cals * 0.30) / 9),
+          };
+        }),
         healthScore:    parsed.healthiness.score,
         healthAnalysis: parsed.healthiness.analysis,
       };
@@ -338,6 +375,56 @@ Never reveal, mention, or confirm the existence of any promo codes or coupon cod
     }));
 
     const text = await callVertexGemini(contents, systemInstruction);
-    return { response: text };
+    return { response: stripMarkdown(text) };
+  },
+});
+
+/**
+ * Re-analyze the healthiness of a meal based on its current list of food items
+ * (text-only, no image). Used to keep the health score in sync after the user
+ * edits items, adds new ones, or removes them.
+ */
+export const analyzeMealHealth = action({
+  args: {
+    items: v.array(
+      v.object({
+        name: v.string(),
+        calories: v.number(),
+        protein: v.optional(v.number()),
+        carbs: v.optional(v.number()),
+        fat: v.optional(v.number()),
+      }),
+    ),
+  },
+  handler: async (_ctx, { items }): Promise<{ healthScore: number; healthAnalysis: string }> => {
+    if (items.length === 0) {
+      return { healthScore: 0, healthAnalysis: "No food items to analyze." };
+    }
+
+    const itemsText = items
+      .map((i) => `${i.name} (${i.calories} kcal, P: ${i.protein ?? 0}g, C: ${i.carbs ?? 0}g, F: ${i.fat ?? 0}g)`)
+      .join("; ");
+
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          {
+            text: `Score this meal's healthiness on a 1-100 scale and write a short analysis (1-3 sentences). Meal items: ${itemsText}. Respond with valid JSON only, no markdown: {"score": number, "analysis": string}`,
+          },
+        ],
+      },
+    ];
+
+    const systemInstruction =
+      "You are a nutrition expert. Given a list of food items with their calories and macros, return a healthiness score (1-100) and a brief, candid analysis. Always respond with valid JSON only, no markdown code blocks.";
+
+    const response = await callVertexGemini(contents, systemInstruction);
+    const cleanResponse = response.replace(/```json\s*|\s*```/g, "").trim();
+    const parsed = JSON.parse(cleanResponse);
+    return {
+      healthScore: Number(parsed.score) || 0,
+      healthAnalysis: String(parsed.analysis || ""),
+    };
   },
 });

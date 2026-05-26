@@ -77,7 +77,8 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { format, addDays, subDays, startOfToday } from 'date-fns';
 
-import { getFoodRecognition, getRecipeSuggestions, getCoachResponse, getNutritionForFood } from '@/app/client-actions';
+import { getFoodRecognition, getRecipeSuggestions, getCoachResponse, getNutritionForFood, analyzeMealHealth } from '@/app/client-actions';
+import { DeleteAccountModal } from '@/components/delete-account-modal';
 import { useToast } from '@/hooks/use-toast';
 import { Logo } from '@/components/logo';
 import { Button } from '@/components/ui/button';
@@ -125,6 +126,7 @@ type FoodItem = {
   carbs: number;
   fat: number;
   confidence?: number;
+  portion?: string;
 };
 
 type MealType = "Breakfast" | "Lunch" | "Dinner" | "Snacks";
@@ -170,12 +172,15 @@ type ChatMessage = {
 
 const augmentWithMacros = (items: RecognizeFoodOutput['foodItems']): FoodItem[] => {
   return items.map(item => {
-    // This is a very rough estimation. A proper implementation would use a food database.
     const { calories } = item;
-    const protein = Math.round((calories * 0.25) / 4);
-    const carbs = Math.round((calories * 0.45) / 4);
-    const fat = Math.round((calories * 0.30) / 9);
-    return { ...item, protein, carbs, fat };
+    const anyItem = item as any;
+    const hasNum = (v: any) => typeof v === 'number' && !Number.isNaN(v);
+    // Prefer the AI's real per-portion macros; fall back to a rough ratio only
+    // when the value is missing (e.g. older cached results).
+    const protein = hasNum(anyItem.protein) ? Math.round(anyItem.protein) : Math.round((calories * 0.25) / 4);
+    const carbs   = hasNum(anyItem.carbs)   ? Math.round(anyItem.carbs)   : Math.round((calories * 0.45) / 4);
+    const fat     = hasNum(anyItem.fat)     ? Math.round(anyItem.fat)     : Math.round((calories * 0.30) / 9);
+    return { ...item, protein, carbs, fat, portion: typeof anyItem.portion === 'string' ? anyItem.portion : undefined };
   });
 };
 
@@ -285,33 +290,49 @@ type TypewriterMessageProps = {
 };
 
 const TypewriterMessage = React.memo(function TypewriterMessage({ content, isLoading = false }: TypewriterMessageProps) {
-  const [displayedText, setDisplayedText] = useState('');
-  const [isComplete, setIsComplete] = useState(false);
+  // `revealed` is the number of characters of `content` to show right now.
+  // We advance it via a recursive setTimeout chain so each tick produces a
+  // separate render cycle (avoids any chance of React 18 auto-batching
+  // squashing the animation into a single paint).
+  const [revealed, setRevealed] = useState(0);
 
   useEffect(() => {
-    if (isLoading) {
-      setDisplayedText('');
-      setIsComplete(false);
-      return;
-    }
+    // Restart from zero whenever the content (or loading state) changes.
+    setRevealed(0);
 
-    if (displayedText.length < content.length) {
-      const timer = setTimeout(() => {
-        setDisplayedText(content.slice(0, displayedText.length + 1));
-      }, 15);
-      return () => clearTimeout(timer);
-    } else {
-      setIsComplete(true);
-    }
-  }, [displayedText, content, isLoading]);
+    if (isLoading || content.length === 0) return;
 
-  const textToDisplay = isLoading ? content : displayedText;
-  const parsedContent = parseFormattedText(textToDisplay);
+    let cancelled = false;
+    let current = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const STEP_MS = 28; // human-readable typewriter pace
+
+    const step = () => {
+      if (cancelled) return;
+      current += 1;
+      setRevealed(current);
+      if (current < content.length) {
+        timer = setTimeout(step, STEP_MS);
+      }
+    };
+
+    timer = setTimeout(step, STEP_MS);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [content, isLoading]);
+
+  const textToShow = isLoading ? content : content.slice(0, revealed);
+  const showCursor = !isLoading && revealed < content.length;
+  const parsedContent = parseFormattedText(textToShow);
 
   return (
     <div className="text-sm whitespace-pre-wrap leading-relaxed">
       {parsedContent}
-      {!isComplete && !isLoading && <span className="animate-pulse">|</span>}
+      {showCursor && <span className="animate-pulse ml-px">|</span>}
     </div>
   );
 });
@@ -345,6 +366,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   const convexLogMeal = useMutation(api.meals.logMeal);
   const convexDeleteMeal = useMutation(api.meals.deleteMealByLocalId);
   const convexUpdateMealItem = useMutation(api.meals.updateMealItem);
+  const convexUpdateMealHealthAnalysis = useMutation(api.meals.updateMealHealthAnalysis);
   const convexUpdateMealType = useMutation(api.meals.updateMealType);
   const convexUpdateProfile = useMutation(api.users.updateProfile);
   const convexRedeemCoupon = useMutation(api.users.redeemCoupon);
@@ -478,6 +500,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   const [credits, setCredits] = useState<CreditData>(defaultCreditData());
   const [isPricingOpen, setIsPricingOpen] = useState(false);
   const [checkoutCancelledOpen, setCheckoutCancelledOpen] = useState(false);
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [noCreditsOpen, setNoCreditsOpen] = useState(false);
   const [noCreditsType, setNoCreditsType] = useState<'meal' | 'ai' | 'recipe'>('meal');
   const [guestUpsellOpen, setGuestUpsellOpen] = useState(false);
@@ -1379,6 +1402,40 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
     }
   };
 
+  /**
+   * Re-runs the AI health analysis against a meal's current items and writes
+   * the new score/analysis to local state + Convex. Fire-and-forget so the UI
+   * stays responsive; failures are non-fatal (the old analysis just remains).
+   */
+  const reanalyzeMealHealth = async (mealId: string, items: FoodItem[]) => {
+    if (items.length === 0) return;
+    try {
+      const { healthScore, healthAnalysis } = await analyzeMealHealth(
+        items.map((i) => ({ name: i.name, calories: i.calories, protein: i.protein, carbs: i.carbs, fat: i.fat })),
+      );
+      setHistory((current) => ({
+        ...current,
+        [dateKey]: {
+          ...current[dateKey],
+          water: current[dateKey]?.water || 0,
+          meals: (current[dateKey]?.meals || []).map((m) =>
+            m.id === mealId ? { ...m, healthAnalysis: { score: healthScore, analysis: healthAnalysis } } : m,
+          ),
+        },
+      }));
+      if (userId) {
+        convexUpdateMealHealthAnalysis({
+          userId: userId as any,
+          localId: mealId,
+          healthScore,
+          healthAnalysis,
+        }).catch(console.error);
+      }
+    } catch (err) {
+      console.warn('Health re-analysis failed:', err);
+    }
+  };
+
   const confirmFoodEdit = async (mealId: string, itemIndex: number) => {
     if (!editingFoodItem) return;
     const newName = editingFoodItem.value.trim();
@@ -1386,6 +1443,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
     setIsLookingUpNutrition(true);
     try {
       const nutrition = await getNutritionForFood(newName);
+      let updatedItems: FoodItem[] = [];
       setHistory(current => ({
         ...current,
         [dateKey]: {
@@ -1393,7 +1451,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
           water: current[dateKey]?.water || 0,
           meals: (current[dateKey]?.meals || []).map(m => {
             if (m.id !== mealId) return m;
-            const updatedItems = m.items.map((item, idx) =>
+            updatedItems = m.items.map((item, idx) =>
               idx === itemIndex
                 ? { ...item, name: nutrition.name || newName, calories: nutrition.calories, protein: nutrition.protein, carbs: nutrition.carbs, fat: nutrition.fat }
                 : item
@@ -1416,6 +1474,8 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
         }).catch(console.error);
       }
       toast({ title: 'Updated!', description: `Nutrition recalculated for "${nutrition.name || newName}".` });
+      // Re-run the health analysis so the score reflects the edited items.
+      void reanalyzeMealHealth(mealId, updatedItems);
     } catch {
       toast({ title: 'Lookup failed', description: 'Could not fetch nutrition. Please try again.', variant: 'destructive' });
     } finally {
@@ -2330,6 +2390,15 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                           <Power className="h-4 w-4 mr-2" /> Sign Out
                         </Button>
                       </SheetClose>
+                    )}
+                    {isAuthenticated && (
+                      <button
+                        type="button"
+                        onClick={() => setDeleteAccountOpen(true)}
+                        className="block w-full mt-2 px-2 py-2 text-xs text-destructive hover:text-destructive hover:bg-destructive/10 rounded-md transition-colors text-center font-medium"
+                      >
+                        <Trash2 className="h-4 w-4 mr-2 inline" /> Delete Account
+                      </button>
                     )}
                     {userEmail?.toLowerCase() === 'elitesquadp@protonmail.com' && (
                       <a
@@ -3343,6 +3412,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
 
       {/* Auth Modal (for guest sign-up from within dashboard) */}
       <AuthModal open={isAuthModalOpen} onOpenChange={setIsAuthModalOpen} defaultTab={authModalTab} />
+      <DeleteAccountModal open={deleteAccountOpen} onOpenChange={setDeleteAccountOpen} />
 
       <Dialog open={!!pendingDuplicate} onOpenChange={(open) => !open && handleDuplicateCancel()}>
         <DialogContent className="sm:max-w-[425px]">

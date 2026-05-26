@@ -57,6 +57,17 @@ export default defineSchema({
       // so existing rows (written before this field existed) remain valid;
       // treat `undefined` as opt-in for backwards compatibility.
       broadcastEmails: v.optional(v.boolean()),
+      // Native push to the notification drawer when daily calorie goal is hit.
+      // Optional so existing rows remain valid; treat `undefined` as opt-in.
+      calorieGoalReached: v.optional(v.boolean()),
+      // Per-user meal reminder times as "HH:MM" 24h strings. Optional so
+      // existing rows remain valid; treat `undefined` as the defaults
+      // 08:00 / 12:00 / 18:00.
+      mealReminderTimes: v.optional(v.object({
+        breakfast: v.string(),
+        lunch: v.string(),
+        dinner: v.string(),
+      })),
     })),
   }).index("by_userId", ["userId"]),
 
