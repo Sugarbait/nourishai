@@ -24,6 +24,7 @@ import type * as conversations from "../conversations.js";
 import type * as crons from "../crons.js";
 import type * as emails from "../emails.js";
 import type * as gemini from "../gemini.js";
+import type * as googlePlayBilling from "../googlePlayBilling.js";
 import type * as http from "../http.js";
 import type * as meals from "../meals.js";
 import type * as notifications from "../notifications.js";
@@ -58,6 +59,7 @@ declare const fullApi: ApiFromModules<{
   crons: typeof crons;
   emails: typeof emails;
   gemini: typeof gemini;
+  googlePlayBilling: typeof googlePlayBilling;
   http: typeof http;
   meals: typeof meals;
   notifications: typeof notifications;
