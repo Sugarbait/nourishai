@@ -52,6 +52,7 @@ export function PricingModal({ open, onOpenChange, credits, onCreditsUpdate, isG
   const [isCheckingOut, setIsCheckingOut] = useState(false);
 
   const checkout = async (priceKey: string) => {
+    if (isCheckingOut) return; // guard against double-taps
     setIsCheckingOut(true);
     try {
       const result = await createCheckoutSession({
@@ -214,8 +215,8 @@ export function PricingModal({ open, onOpenChange, credits, onCreditsUpdate, isG
                     <div className="text-xs text-muted-foreground">/month</div>
                   </>
                 )}
-                <Button size="sm" className="mt-3 w-full" onClick={handleSubscribe}>
-                  Subscribe
+                <Button size="sm" className="mt-3 w-full" onClick={handleSubscribe} disabled={isCheckingOut}>
+                  {isCheckingOut ? 'Processing…' : 'Subscribe'}
                 </Button>
               </div>
             </div>
@@ -277,8 +278,8 @@ export function PricingModal({ open, onOpenChange, credits, onCreditsUpdate, isG
                     Never expires
                   </li>
                 </ul>
-                <Button size="sm" className="w-full" onClick={() => handleBuyPack(pkg)} disabled={!isGuest && !isSubscribed}>
-                  {!isGuest && !isSubscribed ? 'Subscribers Only' : 'Buy Now'}
+                <Button size="sm" className="w-full" onClick={() => handleBuyPack(pkg)} disabled={(!isGuest && !isSubscribed) || isCheckingOut}>
+                  {!isGuest && !isSubscribed ? 'Subscribers Only' : isCheckingOut ? 'Processing…' : 'Buy Now'}
                 </Button>
               </div>
             );

@@ -45,21 +45,21 @@ export async function getRecipeSuggestions(input: {
   }
 }
 
-export async function getNutritionForFood(foodName: string): Promise<{ name: string; calories: number; protein: number; carbs: number; fat: number }> {
-  try {
-    return await getConvex().action(api.gemini.lookupFoodNutrition, { foodName });
-  } catch (error) {
-    console.error('Error in getNutritionForFood:', error);
-    throw new Error('Failed to look up nutrition. Please try again.');
-  }
-}
-
 export async function analyzeMealHealth(items: { name: string; calories: number; protein?: number; carbs?: number; fat?: number }[]): Promise<{ healthScore: number; healthAnalysis: string }> {
   try {
     return await getConvex().action(api.gemini.analyzeMealHealth, { items });
   } catch (error) {
     console.error('Error in analyzeMealHealth:', error);
     throw new Error('Failed to re-analyze meal.');
+  }
+}
+
+export async function getNutritionForFood(foodName: string): Promise<{ name: string; calories: number; protein: number; carbs: number; fat: number }> {
+  try {
+    return await getConvex().action(api.gemini.lookupFoodNutrition, { foodName });
+  } catch (error) {
+    console.error('Error in getNutritionForFood:', error);
+    throw new Error('Failed to look up nutrition. Please try again.');
   }
 }
 

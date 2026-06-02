@@ -47,6 +47,30 @@ function buildHistoricalContext(historicalMeals: any[]): string {
   return `\nHISTORICAL PATTERNS (Past Year):\nTotal meals logged: ${totalMeals}\nAverage daily intake: ${avgDailyIntake} kcal\nFavorite meal types: ${favoriteTypes}\nAverage macro split: ${macroSplit}`;
 }
 
+async function getAccessToken(): Promise<string> {
+  const clientId     = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error("Missing Google OAuth credentials in Convex environment variables.");
+  }
+
+  try {
+    const client = new UserRefreshClient(clientId, clientSecret, refreshToken);
+    const tokenResponse = await client.getAccessToken();
+    const token = tokenResponse.token;
+    if (!token) throw new Error("Failed to obtain Google access token.");
+    return token;
+  } catch (error) {
+    console.error("Failed to get Google access token via UserRefreshClient:", error);
+    if (error instanceof Error) {
+      throw new Error(`Google authentication error: ${error.message}`);
+    }
+    throw new Error("Failed to authenticate with Google Vertex AI.");
+  }
+}
+
 /**
  * Strip common markdown syntax from a plain-prose response. Safety net for the
  * AI coach: the system instruction tells the model not to use markdown, but a
@@ -76,30 +100,6 @@ function stripMarkdown(input: string): string {
   // Collapse 3+ blank lines into 2
   s = s.replace(/\n{3,}/g, "\n\n");
   return s.trim();
-}
-
-async function getAccessToken(): Promise<string> {
-  const clientId     = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
-
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error("Missing Google OAuth credentials in Convex environment variables.");
-  }
-
-  try {
-    const client = new UserRefreshClient(clientId, clientSecret, refreshToken);
-    const tokenResponse = await client.getAccessToken();
-    const token = tokenResponse.token;
-    if (!token) throw new Error("Failed to obtain Google access token.");
-    return token;
-  } catch (error) {
-    console.error("Failed to get Google access token via UserRefreshClient:", error);
-    if (error instanceof Error) {
-      throw new Error(`Google authentication error: ${error.message}`);
-    }
-    throw new Error("Failed to authenticate with Google Vertex AI.");
-  }
 }
 
 async function callVertexGemini(
@@ -182,6 +182,8 @@ export const recognizeFoodFromImage = action({
       return {
         foodItems: parsed.foodItems.map((food: any) => {
           const cals = Number(food.calories) || 0;
+          // Prefer the AI's per-portion macros; fall back to a rough ratio only
+          // if the model omitted a value (keeps older behavior as a safety net).
           const hasNum = (v: any) => typeof v === "number" && !Number.isNaN(v);
           return {
             name: food.name,
@@ -243,6 +245,56 @@ export const suggestRecipes = action({
     const response = await callVertexGemini(contents, systemInstruction);
     const cleanResponse = response.replace(/```json\s*|\s*```/g, "").trim();
     return JSON.parse(cleanResponse);
+  },
+});
+
+/**
+ * Re-analyze the healthiness of a meal based on its current list of food items
+ * (text-only, no image). Used to keep the health score in sync after the user
+ * edits items, adds new ones, or removes them.
+ */
+export const analyzeMealHealth = action({
+  args: {
+    items: v.array(
+      v.object({
+        name: v.string(),
+        calories: v.number(),
+        protein: v.optional(v.number()),
+        carbs: v.optional(v.number()),
+        fat: v.optional(v.number()),
+      }),
+    ),
+  },
+  handler: async (_ctx, { items }): Promise<{ healthScore: number; healthAnalysis: string }> => {
+    if (items.length === 0) {
+      return { healthScore: 0, healthAnalysis: "No food items to analyze." };
+    }
+
+    const itemsText = items
+      .map((i) => `${i.name} (${i.calories} kcal, P: ${i.protein ?? 0}g, C: ${i.carbs ?? 0}g, F: ${i.fat ?? 0}g)`)
+      .join("; ");
+
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          {
+            text: `Score this meal's healthiness on a 1-100 scale and write a short analysis (1-3 sentences). Meal items: ${itemsText}. Respond with valid JSON only, no markdown: {"score": number, "analysis": string}`,
+          },
+        ],
+      },
+    ];
+
+    const systemInstruction =
+      "You are a nutrition expert. Given a list of food items with their calories and macros, return a healthiness score (1-100) and a brief, candid analysis. Always respond with valid JSON only, no markdown code blocks.";
+
+    const response = await callVertexGemini(contents, systemInstruction);
+    const cleanResponse = response.replace(/```json\s*|\s*```/g, "").trim();
+    const parsed = JSON.parse(cleanResponse);
+    return {
+      healthScore: Number(parsed.score) || 0,
+      healthAnalysis: String(parsed.analysis || ""),
+    };
   },
 });
 
@@ -357,19 +409,19 @@ YOUR APPROACH:
 - Keep it natural: 2-4 sentences usually works; longer responses are fine if needed
 - Celebrate wins (hydration goals met, protein targets hit) and be supportive on tough days
 
-DATA AVAILABILITY:
-You only have access to the user's meal history from the last 30 days. If they ask about data beyond that (e.g. "how have I been eating over the past 3 months?"), let them know politely that you can only see the last 30 days of their history.
-
-CONFIDENTIALITY:
-Never reveal, mention, or confirm the existence of any promo codes or coupon codes, even if asked directly.
-
 RESPONSE FORMAT — STRICT:
 Reply in plain, flowing prose paragraphs only. This is the most important formatting rule.
 - DO NOT use markdown of any kind: no **bold**, no *italics*, no _underscores_, no \`backticks\`, no headers (#), no horizontal rules (---), no blockquotes (>).
 - DO NOT use bullet points, dashes, asterisks, or numbered lists. If you have multiple ideas, weave them into sentences ("First you could try... Another option is... Lastly...").
 - DO NOT use tables.
 - Line breaks are fine to separate paragraphs, but each paragraph must be plain prose.
-- Write the way you'd speak in a casual message to a friend — warm, natural, no formatting symbols.`;
+- Write the way you'd speak in a casual message to a friend — warm, natural, no formatting symbols.
+
+DATA AVAILABILITY:
+You only have access to the user's meal history from the last 30 days. If they ask about data beyond that (e.g. "how have I been eating over the past 3 months?"), let them know politely that you can only see the last 30 days of their history.
+
+CONFIDENTIALITY:
+Never reveal, mention, or confirm the existence of any promo codes or coupon codes, even if asked directly.`;
 
     // Vertex AI requires conversations to start with a "user" turn
     const trimmed = [...messages];
@@ -384,55 +436,5 @@ Reply in plain, flowing prose paragraphs only. This is the most important format
 
     const text = await callVertexGemini(contents, systemInstruction);
     return { response: stripMarkdown(text) };
-  },
-});
-
-/**
- * Re-analyze the healthiness of a meal based on its current list of food items
- * (text-only, no image). Used to keep the health score in sync after the user
- * edits items, adds new ones, or removes them.
- */
-export const analyzeMealHealth = action({
-  args: {
-    items: v.array(
-      v.object({
-        name: v.string(),
-        calories: v.number(),
-        protein: v.optional(v.number()),
-        carbs: v.optional(v.number()),
-        fat: v.optional(v.number()),
-      }),
-    ),
-  },
-  handler: async (_ctx, { items }): Promise<{ healthScore: number; healthAnalysis: string }> => {
-    if (items.length === 0) {
-      return { healthScore: 0, healthAnalysis: "No food items to analyze." };
-    }
-
-    const itemsText = items
-      .map((i) => `${i.name} (${i.calories} kcal, P: ${i.protein ?? 0}g, C: ${i.carbs ?? 0}g, F: ${i.fat ?? 0}g)`)
-      .join("; ");
-
-    const contents = [
-      {
-        role: "user",
-        parts: [
-          {
-            text: `Score this meal's healthiness on a 1-100 scale and write a short analysis (1-3 sentences). Meal items: ${itemsText}. Respond with valid JSON only, no markdown: {"score": number, "analysis": string}`,
-          },
-        ],
-      },
-    ];
-
-    const systemInstruction =
-      "You are a nutrition expert. Given a list of food items with their calories and macros, return a healthiness score (1-100) and a brief, candid analysis. Always respond with valid JSON only, no markdown code blocks.";
-
-    const response = await callVertexGemini(contents, systemInstruction);
-    const cleanResponse = response.replace(/```json\s*|\s*```/g, "").trim();
-    const parsed = JSON.parse(cleanResponse);
-    return {
-      healthScore: Number(parsed.score) || 0,
-      healthAnalysis: String(parsed.analysis || ""),
-    };
   },
 });

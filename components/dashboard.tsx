@@ -1,8 +1,21 @@
 'use client';
 
-const BUILD_VERSION = process.env.NEXT_PUBLIC_APP_VERSION ?? "0.3.8";
+const BUILD_VERSION = process.env.NEXT_PUBLIC_APP_VERSION ?? "0.3.83";
+
+async function saveWithRetry(fn: () => Promise<unknown>, maxAttempts = 3): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await fn();
+      return;
+    } catch (err) {
+      if (attempt === maxAttempts) throw err;
+      await new Promise((r) => setTimeout(r, 600 * attempt));
+    }
+  }
+}
 
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import {
   Camera,
@@ -70,6 +83,7 @@ import { NoCreditsModal } from '@/components/no-credits-modal';
 import { GuestUpsellModal } from '@/components/guest-upsell-modal';
 import { GoalCelebration } from '@/components/goal-celebration';
 import { AuthModal } from '@/components/auth-modal';
+import { DeleteAccountModal } from '@/components/delete-account-modal';
 import { useAction, useQuery, useMutation } from 'convex/react';
 import { api } from '@/convex/_generated/api';
 import { useForm, useFieldArray } from "react-hook-form";
@@ -78,7 +92,6 @@ import * as z from "zod";
 import { format, addDays, subDays, startOfToday } from 'date-fns';
 
 import { getFoodRecognition, getRecipeSuggestions, getCoachResponse, getNutritionForFood, analyzeMealHealth } from '@/app/client-actions';
-import { DeleteAccountModal } from '@/components/delete-account-modal';
 import { useToast } from '@/hooks/use-toast';
 import { Logo } from '@/components/logo';
 import { Button } from '@/components/ui/button';
@@ -117,6 +130,7 @@ import type { SuggestRecipesOutput } from '@/ai/types/recipe';
 import { ModeToggle } from './mode-toggle';
 import { NotificationSettings } from './notification-settings';
 import { useNotification, DEFAULT_NOTIFICATION_PREFS } from './notification-context';
+import { DEFAULT_MEAL_TIMES } from '@/lib/mealTimes';
 import type { ChatWithCoachInput } from '@/ai/types/chat';
 
 type FoodItem = {
@@ -125,8 +139,8 @@ type FoodItem = {
   protein: number;
   carbs: number;
   fat: number;
-  confidence?: number;
   portion?: string;
+  confidence?: number;
 };
 
 type MealType = "Breakfast" | "Lunch" | "Dinner" | "Snacks";
@@ -293,7 +307,8 @@ const TypewriterMessage = React.memo(function TypewriterMessage({ content, isLoa
   // `revealed` is the number of characters of `content` to show right now.
   // We advance it via a recursive setTimeout chain so each tick produces a
   // separate render cycle (avoids any chance of React 18 auto-batching
-  // squashing the animation into a single paint).
+  // squashing the animation into a single paint, which is the most plausible
+  // cause of "appears all at once" on some WebViews).
   const [revealed, setRevealed] = useState(0);
 
   useEffect(() => {
@@ -306,7 +321,7 @@ const TypewriterMessage = React.memo(function TypewriterMessage({ content, isLoa
     let current = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
-    const STEP_MS = 28; // human-readable typewriter pace
+    const STEP_MS = 28; // human-readable typewriter pace on mobile
 
     const step = () => {
       if (cancelled) return;
@@ -327,11 +342,10 @@ const TypewriterMessage = React.memo(function TypewriterMessage({ content, isLoa
 
   const textToShow = isLoading ? content : content.slice(0, revealed);
   const showCursor = !isLoading && revealed < content.length;
-  const parsedContent = parseFormattedText(textToShow);
 
   return (
     <div className="text-sm whitespace-pre-wrap leading-relaxed">
-      {parsedContent}
+      {textToShow}
       {showCursor && <span className="animate-pulse ml-px">|</span>}
     </div>
   );
@@ -362,12 +376,11 @@ const COACH_TIPS = [
 
 export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean }) {
   const { toast } = useToast();
-  const getBillingPortalUrl = useAction(api.stripeActions.getBillingPortalUrl);
   const convexLogMeal = useMutation(api.meals.logMeal);
   const convexDeleteMeal = useMutation(api.meals.deleteMealByLocalId);
   const convexUpdateMealItem = useMutation(api.meals.updateMealItem);
-  const convexUpdateMealHealthAnalysis = useMutation(api.meals.updateMealHealthAnalysis);
   const convexUpdateMealType = useMutation(api.meals.updateMealType);
+  const convexUpdateMealHealthAnalysis = useMutation(api.meals.updateMealHealthAnalysis);
   const convexUpdateProfile = useMutation(api.users.updateProfile);
   const convexRedeemCoupon = useMutation(api.users.redeemCoupon);
   const convexConsumeMealCredit = useMutation(api.users.consumeMealCredit);
@@ -409,7 +422,6 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   const [selectedDate, setSelectedDate] = useState<Date>(startOfToday());
   const dateKey = format(selectedDate, 'yyyy-MM-dd');
 
-  const stripeCustomerId = useQuery(api.stripe.getStripeCustomerId, userId ? { userId } : 'skip');
   // Fetch meals for the currently selected date from Convex (cross-device hydration)
   const selectedDateConvexMeals = useQuery(api.meals.getMealsForDate, userId ? { userId: userId as any, date: dateKey } : 'skip');
   // Fetch credits from Convex — source of truth for all authenticated users
@@ -424,13 +436,6 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   const _histEnd = new Date().toISOString().split('T')[0];
   const historicalMeals = useQuery(api.meals.getMealsForDateRange, userId ? { userId: userId as any, startDate: _histStart, endDate: _histEnd } : 'skip') ?? [];
   const trackedDates = useQuery(api.meals.getTrackedDates, userId ? { userId: userId as any } : 'skip');
-
-  const trackedDateObjects = useMemo(() => {
-    if (!trackedDates) return [];
-    return trackedDates
-      .map(d => new Date(d + 'T12:00:00'))
-      .filter(d => !isNaN(d.getTime()));
-  }, [trackedDates]);
 
   // Read user display info from localStorage
   const userName = typeof window !== 'undefined' ? localStorage.getItem('nourish_user_name') : null;
@@ -456,6 +461,21 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
     ? { calories: convexProfile.calorieGoal, protein: convexProfile.proteinGoal, carbs: convexProfile.carbsGoal, fat: convexProfile.fatGoal, water: convexProfile.waterGoal }
     : goals;
   const [history, setHistory] = useState<Record<string, DailyData>>({});
+
+  // Calendar green dots: union of Convex tracked dates (authoritative source, covers
+  // cross-device and historical data) with locally-known meal days from `history`.
+  // The local source makes a dot appear the instant a meal is scanned — before the
+  // Convex save lands. Without it, dots silently vanish whenever a sync is slow or
+  // fails, which is exactly what regressed. Declared after `history` to stay in scope.
+  const trackedDateObjects = useMemo(() => {
+    const dateStrings = new Set<string>(trackedDates ?? []);
+    for (const [day, data] of Object.entries(history)) {
+      if (data?.meals?.length) dateStrings.add(day);
+    }
+    return Array.from(dateStrings)
+      .map(d => new Date(d + 'T12:00:00'))
+      .filter(d => !isNaN(d.getTime()));
+  }, [trackedDates, history]);
 
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [isLoadingAI, setIsLoadingAI] = useState(false);
@@ -499,12 +519,11 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
 
   const [credits, setCredits] = useState<CreditData>(defaultCreditData());
   const [isPricingOpen, setIsPricingOpen] = useState(false);
-  const [checkoutCancelledOpen, setCheckoutCancelledOpen] = useState(false);
-  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [noCreditsOpen, setNoCreditsOpen] = useState(false);
   const [noCreditsType, setNoCreditsType] = useState<'meal' | 'ai' | 'recipe'>('meal');
   const [guestUpsellOpen, setGuestUpsellOpen] = useState(false);
   const [guestUpsellType, setGuestUpsellType] = useState<'scan' | 'coach'>('scan');
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [authModalTab, setAuthModalTab] = useState<'signin' | 'signup'>('signup');
 
@@ -729,16 +748,26 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   useEffect(() => {
     try {
         const isAuth = !!localStorage.getItem('nourish_user_id');
-        if (!isAuth) {
-            // Guest: load history, goals, and profile from localStorage
-            const savedData = localStorage.getItem(APP_STORAGE_KEY);
-            if (savedData) {
+        // Always load history from localStorage — for auth users it acts as a
+        // write-ahead cache so meals scanned before the Convex save completed
+        // aren't lost when the app restarts/updates. The Convex hydration
+        // effect below additively merges in server-side data.
+        const savedData = localStorage.getItem(APP_STORAGE_KEY);
+        if (savedData) {
+            try {
                 const parsedData: AppData = JSON.parse(savedData);
-                const loadedGoals: DailyGoals = { ...parsedData.goals, water: parsedData.goals.water ?? 8 };
-                setGoals(loadedGoals);
-                setHistory(parsedData.history);
-                goalsForm.reset(loadedGoals);
+                if (parsedData.history) setHistory(parsedData.history);
+                // Goals/profile only loaded for guests — auth users get them from Convex.
+                if (!isAuth && parsedData.goals) {
+                    const loadedGoals: DailyGoals = { ...parsedData.goals, water: parsedData.goals.water ?? 8 };
+                    setGoals(loadedGoals);
+                    goalsForm.reset(loadedGoals);
+                }
+            } catch (e) {
+                console.error('Failed to parse saved history', e);
             }
+        }
+        if (!isAuth) {
             const savedProfile = localStorage.getItem(PROFILE_STORAGE_KEY);
             if (savedProfile) {
                 const parsedProfile: UserProfile = JSON.parse(savedProfile);
@@ -746,8 +775,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                 profileForm.reset(parsedProfile);
             }
         } else {
-            // Authenticated: wipe any stale guest data so Convex is the clean source of truth
-            localStorage.removeItem(APP_STORAGE_KEY);
+            // Profile still owned by Convex; clear any stale guest profile cache.
             localStorage.removeItem(PROFILE_STORAGE_KEY);
         }
         // Credits: keep local cache for fast initial render; Convex overrides shortly after
@@ -834,30 +862,77 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDateConvexMeals, dateKey]);
 
+  // Recovery sweep: re-upload any local meal for the selected date that has
+  // no matching localId in Convex. Catches meals that were scanned but whose
+  // convexLogMeal mutation never completed (offline, app killed mid-flight,
+  // app update before sync). Without this, those meals are lost on restart.
+  const recoverySweptRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (isGuest || !userId) return;
+    if (selectedDateConvexMeals === undefined) return; // wait for Convex to respond
+    const localMeals = history[dateKey]?.meals || [];
+    if (localMeals.length === 0) return;
+    const convexLocalIds = new Set(
+      (selectedDateConvexMeals as any[]).map((cm: any) => cm.localId).filter(Boolean),
+    );
+    const orphans = localMeals.filter(
+      (m) => !convexLocalIds.has(m.id) && !recoverySweptRef.current.has(m.id),
+    );
+    if (orphans.length === 0) return;
+    orphans.forEach((m) => recoverySweptRef.current.add(m.id));
+    orphans.forEach((meal) => {
+      const totals = meal.items.reduce(
+        (acc, i) => ({ calories: acc.calories + i.calories, protein: acc.protein + i.protein, carbs: acc.carbs + i.carbs, fat: acc.fat + i.fat }),
+        { calories: 0, protein: 0, carbs: 0, fat: 0 },
+      );
+      (async () => {
+        try {
+          await saveWithRetry(() => convexLogMeal({
+            userId: userId as any,
+            date: dateKey,
+            mealType: normalizeMealType(meal.name),
+            name: meal.name,
+            ...totals,
+            healthScore: meal.healthAnalysis?.score,
+            healthAnalysis: meal.healthAnalysis?.analysis,
+            items: meal.items,
+            localId: meal.id,
+          }));
+          console.log(`[recovery] re-uploaded orphan meal ${meal.id}`);
+        } catch (err) {
+          console.error('[recovery] failed to re-upload orphan meal', meal.id, err);
+          recoverySweptRef.current.delete(meal.id); // allow retry next time
+        }
+      })();
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDateConvexMeals, dateKey, history, isGuest, userId]);
+
   // Sync credits from Convex — authoritative source of truth.
   // Runs whenever convexCredits changes (e.g. after a purchase webhook fires).
-  // Syncs all server state — credits, daily flags, AND subscription — into
-  // localStorage so both Stripe and Google Play subscriptions are reflected.
   useEffect(() => {
     if (!convexCredits) return;
-    const serverSub = (convexCredits as any).subscription as
-      | { active: boolean; plan: 'monthly' | 'yearly' | null; expiresAt: number | null }
-      | null
-      | undefined;
     setCredits(prev => {
+      // Map the server subscription (expiresAt in ms) to local CreditData (ISO string).
+      const serverSub = (convexCredits as any).subscription as
+        | { active: boolean; plan: 'monthly' | 'yearly' | null; expiresAt: number | null }
+        | null
+        | undefined;
+      const subscription = serverSub
+        ? {
+            active: serverSub.active,
+            plan: serverSub.plan,
+            expiresAt: serverSub.expiresAt ? new Date(serverSub.expiresAt).toISOString() : null,
+          }
+        : prev.subscription;
+
       const merged = {
         ...prev,
         credits: convexCredits.credits ?? prev.credits,
         lastFreeDate: convexCredits.lastFreeDate ?? prev.lastFreeDate,
         dailyFreeMealUsed: convexCredits.dailyFreeMealUsed ?? prev.dailyFreeMealUsed,
         dailyFreeAIUsed: convexCredits.dailyFreeAIUsed ?? prev.dailyFreeAIUsed,
-        subscription: serverSub
-          ? {
-              active: serverSub.active,
-              plan: serverSub.plan ?? 'monthly',
-              expiresAt: serverSub.expiresAt ? new Date(serverSub.expiresAt).toISOString() : null,
-            }
-          : prev.subscription,
+        subscription,
       };
       saveCredits(merged);
       return merged;
@@ -865,105 +940,12 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [convexCredits]);
 
-  // After Stripe redirects back with ?checkout=success, poll Convex until the
-  // webhook has updated the credits/subscription, then sync into localStorage.
+  // Google Play Billing handles purchase validation via native callbacks
+  // (no checkout query params needed)
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('checkout') !== 'success') return;
-
-    // Remove the query param so a refresh doesn't re-trigger the sync
-    const cleanUrl = window.location.pathname;
-    window.history.replaceState({}, '', cleanUrl);
-
-    // Poll Convex for up to 15s (webhook may take a moment to fire)
-    const currentUserId = localStorage.getItem('nourish_user_id');
-    const currentEmail  = localStorage.getItem('nourish_user_email');
-    if (!currentUserId && !currentEmail) return;
-
-    const CONVEX_URL = process.env.NEXT_PUBLIC_CONVEX_URL;
-    if (!CONVEX_URL) return;
-
-    let attempts = 0;
-    const MAX_ATTEMPTS = 10;
-    const INTERVAL_MS = 1500;
-
-    const poll = setInterval(async () => {
-      attempts++;
-      try {
-        // Query Convex for updated subscription state + credits in parallel
-        const [subRes, credRes] = await Promise.all([
-          fetch(`${CONVEX_URL}/api/query`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              path: 'stripe:getSubscription',
-              args: { userId: currentUserId ?? '' },
-              format: 'json',
-            }),
-          }),
-          fetch(`${CONVEX_URL}/api/query`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              path: 'stripe:getCreditsForSync',
-              args: { userId: currentUserId ?? '' },
-              format: 'json',
-            }),
-          }),
-        ]);
-        const [subData, credData] = await Promise.all([subRes.json(), credRes.json()]);
-        const sub = subData?.value;
-        const convexCredits = credData?.value;
-
-        // Only consider success if subscription is active OR credits actually increased
-        const prevCredits = loadCredits().credits;
-        const creditsIncreased = convexCredits && convexCredits.credits > prevCredits;
-        const isActivated = sub?.active === true || creditsIncreased;
-
-        if (isActivated || attempts >= MAX_ATTEMPTS) {
-          clearInterval(poll);
-
-          if (isActivated) {
-            // Sync Convex state into localStorage — Convex is source of truth,
-            // so we replace (not add to) the local credit count.
-            const existing = loadCredits();
-            const subPlan = sub?.plan === 'yearly' ? 'monthly' as const : 'monthly' as const;
-            const merged = {
-              ...existing,
-              credits: convexCredits?.credits ?? existing.credits,
-              dailyFreeMealUsed: convexCredits?.dailyFreeMealUsed ?? existing.dailyFreeMealUsed,
-              lastFreeDate: convexCredits?.lastFreeDate ?? existing.lastFreeDate,
-              subscription: sub?.active
-                ? { active: true, plan: subPlan, expiresAt: sub.expiresAt ? new Date(sub.expiresAt).toISOString() : null }
-                : existing.subscription,
-            };
-            saveCredits(merged);
-            setCredits(merged);
-            toast({
-              title: '🎉 Payment successful!',
-              description: sub?.active
-                ? `Your Nourish Pro subscription is now active.`
-                : 'Your credits have been added to your account.',
-            });
-          }
-        }
-      } catch (err) {
-        if (attempts >= MAX_ATTEMPTS) clearInterval(poll);
-      }
-    }, INTERVAL_MS);
-
-    return () => clearInterval(poll);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // When Stripe redirects back with ?checkout=cancelled, show a friendly modal
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('checkout') !== 'cancelled') return;
-    window.history.replaceState({}, '', window.location.pathname);
-    setTimeout(() => setCheckoutCancelledOpen(true), 300);
+    // Placeholder for Google Play Billing callback integration
+    // When a purchase is validated and confirmed by Convex backend,
+    // the credits/subscription will automatically sync via the useEffect above
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -978,10 +960,13 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
     }
   }, [userName, userAvatar]);
 
-  // Save data to localStorage whenever it changes
+  // Save data to localStorage whenever it changes.
+  // For auth users this acts as a write-ahead cache: meals are persisted
+  // locally the moment they're scanned, so an app update/restart before the
+  // Convex save completes doesn't lose them. The mount-time recovery sweep
+  // below re-uploads any orphaned local meals.
   useEffect(() => {
     if (!isMounted) return; // Don't save initial default state
-    if (!isGuest) return; // CLOUD SYNC: Don't save to localStorage if authenticated
     try {
         const dataToSave: AppData = { goals, history };
         localStorage.setItem(APP_STORAGE_KEY, JSON.stringify(dataToSave));
@@ -1049,7 +1034,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intake, dailyData.water, dateKey, isMounted]);
 
-  // Meal reminders at 8 AM, 12 PM, 6 PM
+  // In-app meal reminders at 8 AM, 12 PM, 6 PM (shown only when the app is open)
   useEffect(() => {
     if (!isMounted || isGuest || !notificationPrefs.mealReminders) return;
 
@@ -1128,26 +1113,40 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateKey]);
 
-  useEffect(() => {
-    const getCameraPermission = async () => {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setHasCameraPermission(false);
-        return;
+  const checkCameraPermission = useCallback(async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setHasCameraPermission(false);
+      return false;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      stream.getTracks().forEach(track => track.stop());
+      setHasCameraPermission(true);
+      return true;
+    } catch (error: any) {
+      if (error.name !== 'NotFoundError' && error.name !== 'DevicesNotFoundError') {
+        console.error('Error accessing camera:', error);
       }
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-        stream.getTracks().forEach(track => track.stop());
-        setHasCameraPermission(true);
-      } catch (error: any) {
-        // NotFoundError is expected on devices without a camera (e.g. some desktops)
-        if (error.name !== 'NotFoundError' && error.name !== 'DevicesNotFoundError') {
-          console.error('Error accessing camera:', error);
-        }
-        setHasCameraPermission(false);
-      }
-    };
-    getCameraPermission();
+      setHasCameraPermission(false);
+      return false;
+    }
   }, []);
+
+  useEffect(() => {
+    checkCameraPermission();
+
+    // Re-check when the app returns to the foreground (e.g. after the user
+    // grants the OS-level permission via the system dialog or settings).
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') checkCameraPermission();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('focus', checkCameraPermission);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('focus', checkCameraPermission);
+    };
+  }, [checkCameraPermission]);
 
   // SYNC: When a guest logs in, sync their local history to Convex
   const hasSyncedRef = useRef(false);
@@ -1208,26 +1207,70 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
     syncHistory();
   }, [isMounted, isGuest, userId, history, convexSyncBatchMeals, convexSyncBatchWater]);
 
+  // Auto-scroll the chat to the bottom as content grows — covers BOTH chat
+  // surfaces (inline panel on the dashboard + full-screen coach page) since
+  // they share `chatScrollRef`. Re-runs whenever the active surface changes.
+  //
+  // Mechanics:
+  //  - ResizeObserver watches every direct child of the scroll container.
+  //    The latest message bubble grows char-by-char during the typewriter
+  //    animation; its resize triggers a scroll-to-bottom.
+  //  - MutationObserver watches for new message children being added or
+  //    removed, and re-attaches the ResizeObserver to the current set.
+  //  - We only auto-scroll when the user is already near the bottom (within
+  //    150px). If they've scrolled up to read earlier messages, we leave
+  //    them alone — standard chat UX.
   useEffect(() => {
     const el = chatScrollRef.current;
     if (!el) return;
-    const scrollToBottom = () => { el.scrollTop = el.scrollHeight; };
-    scrollToBottom();
-    const inner = el.firstElementChild;
-    if (!inner || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(scrollToBottom);
-    ro.observe(inner);
-    return () => ro.disconnect();
-  }, [isChatbotOpen]);
 
+    const isNearBottom = () =>
+      el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    const scrollToBottom = () => { el.scrollTop = el.scrollHeight; };
+    const scrollToBottomIfNear = () => { if (isNearBottom()) scrollToBottom(); };
+
+    // Initial scroll when the surface mounts.
+    scrollToBottom();
+
+    if (typeof ResizeObserver === 'undefined' || typeof MutationObserver === 'undefined') return;
+
+    const ro = new ResizeObserver(scrollToBottomIfNear);
+    const observeAllChildren = () => {
+      ro.disconnect();
+      for (const child of Array.from(el.children)) {
+        ro.observe(child);
+      }
+    };
+    observeAllChildren();
+
+    const mo = new MutationObserver(() => {
+      observeAllChildren();
+      // A new bubble was just added; if the user was already at the bottom
+      // we want them to stay there.
+      scrollToBottomIfNear();
+    });
+    mo.observe(el, { childList: true });
+
+    return () => {
+      ro.disconnect();
+      mo.disconnect();
+    };
+  }, [isChatbotOpen, activeNav]);
+
+  // When a new message is sent or the coach starts/finishes a turn, force a
+  // scroll to the bottom — this is the user's own action, so we don't gate
+  // on isNearBottom here.
   useEffect(() => {
     const el = chatScrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [chatMessages, isCoachLoading]);
+    if (!el) return;
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+  }, [chatMessages.length, isCoachLoading]);
 
   const progressData = useMemo(() => {
     if (!recentMeals) return [];
-    
+
     const last7DaysDates = Array.from({ length: 7 }, (_, i) => {
       const d = subDays(new Date(), 6 - i);
       return format(d, 'yyyy-MM-dd');
@@ -1235,7 +1278,17 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
 
     return last7DaysDates.map(date => {
       const dayMeals = recentMeals.filter(m => m.date === date);
-      const totalCalories = dayMeals.reduce((acc, m) => acc + (m.calories || 0), 0);
+      // Include locally-logged meals not yet reflected in the Convex query (e.g. a
+      // meal just scanned today). Dedupe against Convex rows by localId.
+      const convexLocalIds = new Set(dayMeals.map((m: any) => m.localId).filter(Boolean));
+      let totalCalories = dayMeals.reduce((acc, m) => acc + (m.calories || 0), 0);
+      const localDay = history[date];
+      if (localDay) {
+        for (const meal of localDay.meals) {
+          if (convexLocalIds.has(meal.id)) continue;
+          totalCalories += meal.items.reduce((s, it) => s + (it.calories || 0), 0);
+        }
+      }
       const goal = displayGoals.calories || 2000;
       
       let dayName = 'Day';
@@ -1250,27 +1303,36 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
         isToday: date === format(new Date(), 'yyyy-MM-dd')
       };
     });
-  }, [recentMeals, displayGoals.calories]);
+  }, [recentMeals, history, displayGoals.calories]);
 
   const startCamera = async () => {
-    if (hasCameraPermission && !isCameraOn) {
-        try {
-            const videoConstraints = {
-                facingMode: { ideal: 'environment' },
-                width: { ideal: 1920 },
-                height: { ideal: 1080 },
-                aspectRatio: { ideal: 16/9 }
-            };
-            const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints });
-            if (videoRef.current) {
-                videoRef.current.srcObject = stream;
-                setIsCameraOn(true);
-                setImagePreview(null);
-                setAiResults([]);
-                setAiHealthAnalysis(null);
-            }
-        } catch (error) {
-            console.error("Failed to start camera", error);
+    if (isCameraOn) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setHasCameraPermission(false);
+      return;
+    }
+    try {
+        const videoConstraints = {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            aspectRatio: { ideal: 16/9 }
+        };
+        const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints });
+        if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            setIsCameraOn(true);
+            setHasCameraPermission(true);
+            setImagePreview(null);
+            setAiResults([]);
+            setAiHealthAnalysis(null);
+        }
+    } catch (error: any) {
+        console.error("Failed to start camera", error);
+        if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+            setHasCameraPermission(false);
+            toast({ title: 'Camera permission needed', description: 'Please allow camera access in your device settings.', variant: 'destructive' });
+        } else {
             toast({ title: 'Camera Error', description: 'Could not start the camera. Please ensure it is not in use by another application.', variant: 'destructive' });
         }
     }
@@ -1544,19 +1606,35 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
     }
   };
 
+  // Generate a small thumbnail dataUri from the original image so meal history shows
+  // the photo immediately, before (or instead of) the Convex upload completes.
+  const makeThumbnailDataUri = (dataUri: string): Promise<string | null> => {
+    return new Promise((resolve) => {
+      const img = new window.Image();
+      img.onload = () => {
+        const MAX = 200;
+        const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.7));
+      };
+      img.onerror = () => resolve(null);
+      img.src = dataUri;
+    });
+  };
+
   const runFoodRecognition = async (dataUri: string) => {
-    if (!isGuest) {
-      // Use Convex as authoritative credits source; if still loading skip check (optimistic)
-      const authoritativeCredits = convexCredits !== undefined ? {
-        ...credits,
-        credits: convexCredits.credits ?? 0,
-        dailyFreeMealUsed: convexCredits.dailyFreeMealUsed ?? false,
-      } : null;
-      if (authoritativeCredits !== null && availableMealCredits(authoritativeCredits) <= 0) {
-        setNoCreditsType('meal');
-        setNoCreditsOpen(true);
-        return;
-      }
+    // Credit check runs for EVERYONE — guests still get 1 free daily scan, authed
+    // users get free + paid pool. Convex is the authoritative source when loaded.
+    const effectiveCredits = !isGuest && convexCredits
+      ? { ...credits, credits: convexCredits.credits ?? 0, dailyFreeMealUsed: convexCredits.dailyFreeMealUsed ?? false }
+      : credits;
+    if (availableMealCredits(effectiveCredits) <= 0) {
+      setNoCreditsType('meal');
+      setNoCreditsOpen(true);
+      return;
     }
 
     setIsLoadingAI(true);
@@ -1587,7 +1665,8 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
         const healthData = (result.healthScore && result.healthAnalysis)
           ? { score: result.healthScore, analysis: result.healthAnalysis }
           : undefined;
-        const newMeal: Meal = { id: Date.now().toString(), name: mealType, items: foodWithMacros, timestamp: Date.now(), healthAnalysis: healthData };
+        const thumbnail = await makeThumbnailDataUri(dataUri);
+        const newMeal: Meal = { id: Date.now().toString(), name: mealType, items: foodWithMacros, timestamp: Date.now(), healthAnalysis: healthData, imageUrl: thumbnail || undefined };
 
         const currentDailyMeals = history[dateKey]?.meals || [];
         const duplicateMeal = currentDailyMeals.find(m => 
@@ -1675,6 +1754,8 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
         localId: newMeal.id,
       }).catch(console.error);
     }
+    // Generate an initial health analysis for the manually-logged meal.
+    void reanalyzeMealHealth(newMeal.id, items);
     resetCapture();
     toast({ title: 'Meal added!', description: `${mealName} has been added to your log for ${format(selectedDate, 'PPP')}.` });
   };
@@ -1686,13 +1767,16 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
       return;
     }
 
-    if (availableAICredits(credits) <= 0) {
+    const effectiveCredits = !isGuest && convexCredits
+      ? { ...credits, credits: convexCredits.credits ?? 0 }
+      : credits;
+    if (availableAICredits(effectiveCredits) <= 0) {
       setNoCreditsType('recipe');
       setNoCreditsOpen(true);
       return;
     }
 
-    const updatedCredits = consumeAICredit(credits);
+    const updatedCredits = consumeAICredit(effectiveCredits);
     if (!updatedCredits) {
       setNoCreditsType('recipe');
       setNoCreditsOpen(true);
@@ -1730,16 +1814,17 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
       setGuestUpsellOpen(true);
       return;
     }
-    if (!isDev && !credits.subscription?.active && credits.credits <= 0) {
+    const effectivePool = !isGuest && convexCredits
+      ? (convexCredits.credits ?? 0)
+      : (credits.credits ?? 0);
+    if (!isDev && !credits.subscription?.active && effectivePool <= 0) {
       setNoCreditsType('ai');
       setNoCreditsOpen(true);
       return;
     }
 
     setIsChatbotOpen(true);
-    
-
-  }, [isGuest, credits.subscription?.active, credits.credits]);
+  }, [isGuest, credits.subscription?.active, credits.credits, convexCredits]);
 
   const handleManualSubmit = (values: z.infer<typeof manualFoodFormSchema>) => {
     addItemsToLog(values.items, values.mealType);
@@ -1922,14 +2007,18 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
       return;
     }
 
-    if (!isDev && availableAICredits(credits) <= 0) {
+    // Use Convex as authoritative credit source when available.
+    const effectiveCredits = !isGuest && convexCredits
+      ? { ...credits, credits: convexCredits.credits ?? 0 }
+      : credits;
+    if (!isDev && availableAICredits(effectiveCredits) <= 0) {
       setNoCreditsType('ai');
       setNoCreditsOpen(true);
       return;
     }
 
     if (!isDev) {
-      const updatedCredits = consumeAICredit(credits);
+      const updatedCredits = consumeAICredit(effectiveCredits);
       if (!updatedCredits) {
         setNoCreditsType('ai');
         setNoCreditsOpen(true);
@@ -2012,9 +2101,9 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
   }
 
   return (
-    <div className="min-h-screen bg-background text-foreground overflow-x-hidden">
+    <div className="min-h-screen bg-background text-foreground overflow-x-hidden w-full max-w-full">
       <header className="sticky top-0 z-20 bg-background/90 backdrop-blur-xl border-b border-border/50">
-        <div className="container mx-auto flex h-14 items-center justify-between px-4 sm:px-6">
+        <div className="container mx-auto flex h-14 items-center justify-between px-4 sm:px-6 max-w-full">
           <img src="/logo.png" alt="Nourish" className="h-8 w-auto" />
           <div className="flex items-center gap-2 sm:gap-3">
 
@@ -2138,7 +2227,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                   </Avatar>
                 </Button>
               </SheetTrigger>
-              <SheetContent className="overflow-y-auto">
+              <SheetContent className="overflow-y-auto" onOpenAutoFocus={(e) => e.preventDefault()}>
                 <SheetHeader>
                   <div className="flex flex-col items-center gap-3 pb-4">
                     <div className="relative group cursor-pointer" onClick={() => document.getElementById('avatar-upload')?.click()}>
@@ -2262,29 +2351,11 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                               </span>
                             )}
                           </div>
-                          {/* Stripe portal — pause, update payment, or cancel */}
+                          {/* Google Play manages subscriptions automatically */}
                           {userId && (
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              className="w-full"
-                              onClick={async () => {
-                                if (!stripeCustomerId) {
-                                  toast({ title: 'Could not open billing portal', description: 'No Stripe account linked. Subscribe first.', variant: 'destructive' });
-                                  return;
-                                }
-                                try {
-                                  const result = await getBillingPortalUrl({ stripeCustomerId, returnUrl: window.location.href });
-                                  if (result.url) window.location.href = result.url;
-                                } catch (err: any) {
-                                  toast({ title: 'Could not open billing portal', description: err.message || 'Please try again later.', variant: 'destructive' });
-                                }
-                              }}
-                            >
-                              <ExternalLink className="h-3.5 w-3.5 mr-2" />
-                              Manage Subscription
-                            </Button>
+                            <p className="text-xs text-muted-foreground">
+                              Manage your subscription in Google Play Settings
+                            </p>
                           )}
                         </>
                       ) : (
@@ -2345,11 +2416,14 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                       <ModeToggle />
                     </div>
 
-                    <div className="flex items-center justify-between pt-2 pb-1 border-t mt-2">
+                    <div className="flex items-center justify-between gap-3 pt-2 pb-1 border-t mt-2">
                       <span className="text-sm text-muted-foreground">Notification & Email Preferences</span>
                       <button
-                        onClick={() => setIsNotificationSettingsOpen(true)}
-                        className="text-xs text-primary hover:text-primary/80 transition-colors"
+                        onClick={() => {
+                          setIsProfileOpen(false);
+                          setIsNotificationSettingsOpen(true);
+                        }}
+                        className="text-xs text-primary hover:text-primary/80 transition-colors whitespace-nowrap flex-shrink-0"
                       >
                         Settings
                       </button>
@@ -2397,7 +2471,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                           className="w-full mt-2 text-destructive hover:text-destructive hover:bg-destructive/10"
                           onClick={() => {
                             clearAuthStorage();
-                            window.location.href = '/';
+                            window.location.href = window.location.origin + '/index.html';
                           }}
                         >
                           <Power className="h-4 w-4 mr-2" /> Sign Out
@@ -2415,7 +2489,8 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                     )}
                     {userEmail?.toLowerCase() === 'elitesquadp@protonmail.com' && (
                       <a
-                        href="/admin"
+                        href="/admin/signin/index.html"
+                        onClick={(e) => { e.preventDefault(); window.location.href = window.location.origin + '/admin/signin/index.html'; }}
                         className="block w-full text-center text-xs text-green-600 dark:text-green-400 hover:underline mt-2 font-medium"
                       >
                         Admin Panel
@@ -2459,9 +2534,9 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
       )}
 
       {activeNav === 'dashboard' && (
-      <main className="container mx-auto p-4 md:px-6 pb-24 pt-6">
-        <div className="grid gap-8 md:grid-cols-5 lg:grid-cols-3">
-          <div className="md:col-span-3 lg:col-span-2 space-y-6">
+      <main className="container mx-auto p-4 md:px-6 pb-24 pt-6 max-w-full w-full">
+        <div className="grid gap-8 md:grid-cols-5 lg:grid-cols-3 min-w-0">
+          <div className="md:col-span-3 lg:col-span-2 space-y-6 min-w-0">
             <Card id="scan-section" className="shadow-xl rounded-2xl border-border/50 overflow-hidden">
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2 text-xl font-bold"><Camera className="text-primary" /> Snap Your Meal</CardTitle>
@@ -2583,8 +2658,14 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                                         {aiResults.map((item, index) => (
                                             <div key={index} className="flex items-center justify-between rounded-lg border p-3">
                                                 <div>
-                                                    <p className="font-medium">{item.name}</p>
+                                                    <p className="font-medium">
+                                                        {item.name}
+                                                        {item.portion ? <span className="text-xs font-normal text-muted-foreground"> · {item.portion}</span> : null}
+                                                    </p>
                                                     <p className="text-sm text-muted-foreground">{item.calories} kcal</p>
+                                                    <p className="text-xs text-muted-foreground mt-0.5">
+                                                        P {item.protein}g · C {item.carbs}g · F {item.fat}g
+                                                    </p>
                                                 </div>
                                                 <Badge variant="secondary" className="hidden sm:inline-flex">
                                                     {item.confidence ? `~${Math.round(item.confidence * 100)}% Conf.` : 'Manual'}
@@ -2741,7 +2822,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                 <CardContent className="px-3 sm:px-6">
                     {dailyData.meals.length > 0 ? (
                         <div className="space-y-4">
-                            {dailyData.meals.map(meal => {
+                            {[...dailyData.meals].sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0)).map(meal => {
                                 const totalCals = meal.items.reduce((acc, i) => acc + i.calories, 0);
                                 const totalProtein = meal.items.reduce((acc, i) => acc + (i.protein || 0), 0);
                                 const totalCarbs = meal.items.reduce((acc, i) => acc + (i.carbs || 0), 0);
@@ -2930,7 +3011,7 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
             </Card>
           </div>
 
-          <div className="md:col-span-2 lg:col-span-1 space-y-6">
+          <div className="md:col-span-2 lg:col-span-1 space-y-6 min-w-0">
 
             {/* ── My Goals Card ── */}
             <Card className="shadow-xl rounded-2xl border-border/50 overflow-hidden">
@@ -3026,41 +3107,6 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                     </SheetContent>
                   </Sheet>
 
-                  <Sheet open={isNotificationSettingsOpen} onOpenChange={setIsNotificationSettingsOpen}>
-                    <SheetContent side="right" className="w-full sm:max-w-md overflow-y-auto">
-                      <SheetHeader className="mb-5">
-                        <SheetTitle className="flex items-center gap-2"><Bell className="h-5 w-5 text-primary"/> Notification & Email Preferences</SheetTitle>
-                        <SheetDescription>Manage which notifications you want to receive in-app and by email.</SheetDescription>
-                      </SheetHeader>
-                      <NotificationSettings
-                        preferences={notificationPrefs}
-                        onSave={async (prefs) => {
-                          if (!userId) {
-                            addNotification('Please sign in to save preferences', 'warning');
-                            return;
-                          }
-                          try {
-                            const result = await updateNotificationPreferencesMut({
-                              userId: userId as any,
-                              mealReminders: prefs.mealReminders,
-                              goalNudges: prefs.goalNudges,
-                              creditResetAlert: prefs.creditResetAlert,
-                              coachInsights: prefs.coachInsights,
-                              broadcastEmails: prefs.broadcastEmails,
-                            });
-                            if (result?.success) {
-                              addNotification('Notification preferences saved', 'success');
-                              setIsNotificationSettingsOpen(false);
-                            } else {
-                              addNotification('Could not save — profile not found', 'warning');
-                            }
-                          } catch {
-                            addNotification('Failed to save preferences', 'warning');
-                          }
-                        }}
-                      />
-                    </SheetContent>
-                  </Sheet>
                 </CardTitle>
                 <CardDescription>Your daily nutrition targets at a glance.</CardDescription>
               </CardHeader>
@@ -3082,12 +3128,6 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                     </div>
                   ))}
                 </div>
-                <button
-                  onClick={() => setGoalsOpen(true)}
-                  className="mt-3 w-full rounded-xl border border-dashed border-border/60 py-2 text-xs text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors"
-                >
-                  + Tap to adjust goals
-                </button>
               </CardContent>
             </Card>
 
@@ -3222,6 +3262,45 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
       </main>
       )}
 
+      {/* Notification Settings Sheet — available from any tab */}
+      <Sheet open={isNotificationSettingsOpen} onOpenChange={setIsNotificationSettingsOpen}>
+        <SheetContent side="right" className="w-full sm:max-w-md overflow-y-auto">
+          <SheetHeader className="mb-5">
+            <SheetTitle className="flex items-center gap-2"><Bell className="h-5 w-5 text-primary"/> Notification & Email Preferences</SheetTitle>
+            <SheetDescription>Manage which notifications you want to receive in-app and by email.</SheetDescription>
+          </SheetHeader>
+          <NotificationSettings
+            preferences={notificationPrefs}
+            onSave={async (prefs) => {
+              if (!userId) {
+                addNotification('Please sign in to save preferences', 'warning');
+                return;
+              }
+              try {
+                const times = prefs.mealReminderTimes ?? DEFAULT_MEAL_TIMES;
+                const result = await updateNotificationPreferencesMut({
+                  userId: userId as any,
+                  mealReminders: prefs.mealReminders,
+                  goalNudges: prefs.goalNudges,
+                  creditResetAlert: prefs.creditResetAlert,
+                  coachInsights: prefs.coachInsights,
+                  broadcastEmails: prefs.broadcastEmails,
+                  calorieGoalReached: prefs.calorieGoalReached,
+                  mealReminderTimes: times,
+                });
+                if (result?.success) {
+                  addNotification('Notification preferences saved', 'success');
+                  setIsNotificationSettingsOpen(false);
+                } else {
+                  addNotification('Could not save — profile not found', 'warning');
+                }
+              } catch {
+                addNotification('Failed to save preferences', 'warning');
+              }
+            }}
+          />
+        </SheetContent>
+      </Sheet>
 
       {/* Chat Widget Panel — fixed bottom-right, only on dashboard tab */}
       {activeNav === 'dashboard' && isChatbotOpen && (
@@ -3371,9 +3450,14 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                     )}
                   </div>
                   {message.role === 'user' && (
-                    <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
-                      <User className="h-3 w-3 text-primary" />
-                    </div>
+                    <Avatar className="h-6 w-6 flex-shrink-0">
+                      {!isGuest && (profile.avatar || userAvatar) && (
+                        <AvatarImage src={profile.avatar || userAvatar || ''} alt="You" className="object-cover" />
+                      )}
+                      <AvatarFallback className="bg-primary/10 text-primary text-[10px] font-semibold">
+                        {isGuest ? 'G' : profile.name ? profile.name.charAt(0).toUpperCase() : <User className="h-3 w-3 text-primary" />}
+                      </AvatarFallback>
+                    </Avatar>
                   )}
                 </div>
               ))}
@@ -3458,29 +3542,6 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
         userEmail={userEmail}
       />
 
-      {/* Checkout cancelled notice — shown when user returns from Stripe without paying */}
-      <Dialog open={checkoutCancelledOpen} onOpenChange={setCheckoutCancelledOpen}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <div className="mx-auto mb-2 flex h-12 w-12 items-center justify-center rounded-full bg-amber-500/15">
-              <CreditCard className="h-6 w-6 text-amber-500" />
-            </div>
-            <DialogTitle className="text-center">No payment was made</DialogTitle>
-            <DialogDescription className="text-center pt-1">
-              You came back without completing checkout — your card hasn't been charged and nothing was processed. You can subscribe any time from the menu when you're ready.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex flex-col-reverse sm:flex-row gap-2 mt-2">
-            <Button variant="outline" className="flex-1" onClick={() => setCheckoutCancelledOpen(false)}>
-              Close
-            </Button>
-            <Button className="flex-1" onClick={() => { setCheckoutCancelledOpen(false); setIsPricingOpen(true); }}>
-              View plans
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
       {/* Goal Celebration */}
       <GoalCelebration
         open={!!celebrationGoal}
@@ -3505,12 +3566,30 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
       />
 
       {activeNav === 'dashboard' && (
-        <footer className="border-t border-border/40 mt-8 py-5 px-4 pb-20">
-          <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-muted-foreground">
+        <footer
+          className="border-t border-border/40 mt-8 px-4 pt-5"
+          // Composes the 128px clearance for the bottom nav (which itself reserves
+          // safe-area-inset-bottom internally) with the device's gesture-bar inset
+          // in a SINGLE padding-bottom declaration so nothing can override it.
+          style={{ paddingBottom: 'calc(8rem + env(safe-area-inset-bottom))' }}
+        >
+          <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-muted-foreground">
             <span>© {new Date().getFullYear()} Nourish. All rights reserved.</span>
             <div className="flex gap-5">
-              <a href="/privacy" className="hover:text-foreground transition-colors">Privacy Policy</a>
-              <a href="/terms" className="hover:text-foreground transition-colors">Terms of Service</a>
+              <a
+                href="/privacy/index.html"
+                onClick={(e) => { e.preventDefault(); window.location.href = window.location.origin + '/privacy/index.html'; }}
+                className="py-2 px-1 hover:text-foreground transition-colors cursor-pointer"
+              >
+                Privacy Policy
+              </a>
+              <a
+                href="/terms/index.html"
+                onClick={(e) => { e.preventDefault(); window.location.href = window.location.origin + '/terms/index.html'; }}
+                className="py-2 px-1 hover:text-foreground transition-colors cursor-pointer"
+              >
+                Terms of Service
+              </a>
             </div>
           </div>
         </footer>
@@ -3613,17 +3692,18 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
                     : 'bg-muted rounded-bl-sm'
                 }`}>
                   {message.role === 'model' ? (
-                    <div className="space-y-1">
-                      {message.content.split('\n').map((line, i) => (
-                        <p key={i}>{parseFormattedText(line)}</p>
-                      ))}
-                    </div>
+                    <TypewriterMessage content={message.content} isLoading={false} />
                   ) : message.content}
                 </div>
                 {message.role === 'user' && (
-                  <div className="w-7 h-7 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0 mt-1">
-                    <User className="h-3.5 w-3.5 text-primary" />
-                  </div>
+                  <Avatar className="h-7 w-7 flex-shrink-0 mt-1">
+                    {!isGuest && (profile.avatar || userAvatar) && (
+                      <AvatarImage src={profile.avatar || userAvatar || ''} alt="You" className="object-cover" />
+                    )}
+                    <AvatarFallback className="bg-primary/10 text-primary text-[11px] font-semibold">
+                      {isGuest ? 'G' : profile.name ? profile.name.charAt(0).toUpperCase() : <User className="h-3.5 w-3.5 text-primary" />}
+                    </AvatarFallback>
+                  </Avatar>
                 )}
               </div>
             ))}
@@ -3714,7 +3794,6 @@ export function Dashboard({ isGuest: _isGuestProp = false }: { isGuest?: boolean
             onClick={() => {
               if (isCameraOn) {
                 handleCapturePhoto();
-                toast({ title: 'Photo Captured', description: '1 credit deducted. Analyzing your meal...' });
               } else {
                 setActiveNav('dashboard');
                 setTimeout(() => { document.getElementById('scan-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); startCamera(); }, 50);
